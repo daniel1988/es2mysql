@@ -2,124 +2,142 @@
 package Store
 
 import (
-    Common "Common"
-    "encoding/json"
-    "flag"
-    "fmt"
-    es "github.com/mattbaird/elastigo/lib"
-    "strings"
-    "sync"
+	Common "Common"
+	"context"
+	"flag"
+	"fmt"
+	simplejson "github.com/bitly/go-simplejson"
+	"github.com/elastic/go-elasticsearch/v7"
+	"github.com/elastic/go-elasticsearch/v7/esapi"
+	"io/ioutil"
+	"strings"
+	"sync"
 )
 
 var (
-    flgCalc = flag.String("calcindex", "", "calc index function method")
+	flgCalc = flag.String("calcindex", "", "calc index function method")
 )
 
 // 不是很确定ES的连接安全性，所以用了锁
 type ElasticSearch struct {
-    sync.Mutex
-    *es.Conn
+	sync.Mutex
+	*elasticsearch.Client
 }
 
 // ES的请求回应是HTTP-REST方式
-func NewStaticStore(ip, port string) *ElasticSearch {
-    defer Common.CheckPanic()
-    c := es.NewConn()
-    c.Domain = ip
-    c.Port = port
+func NewElasticSearch(ip, port string) *ElasticSearch {
+	defer Common.CheckPanic()
 
-    return &ElasticSearch{sync.Mutex{}, c}
+	addr := fmt.Sprintf("http://%v:%v", ip, port)
+	config := elasticsearch.Config{}
+	config.Addresses = []string{addr}
+	client, err := elasticsearch.NewClient(config)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	return &ElasticSearch{sync.Mutex{}, client}
 }
 
-// 关闭ES时刷入缓存
-func (this *ElasticSearch) Close() {
-    defer Common.CheckPanic()
-    this.Flush()
+/**
+ * 创建索引
+ * @param  {[type]} this *             ElasticSearch) CreateIndex(idx string, body string [description]
+ * @return {[type]}      [description]
+ */
+func (this *ElasticSearch) CreateIndex(idx string, body string) {
+	req := esapi.IndicesCreateRequest{
+		Index: idx,
+		Body:  strings.NewReader(body),
+	}
+
+	resp, _ := req.Do(context.Background(), this.Client)
+	return this.ReadResp(resp)
 }
 
-// 索引生成，在需要优化索引性能时添加新方法
-func (this *ElasticSearch) CalcIndex(index, _type, id string) string {
-    switch *flgCalc {
-    case "index-id1":
-        return strings.ToLower(fmt.Sprintf("%s-%v", index, id[:1]))
-    }
-
-    return strings.ToLower(index)
+/**
+ * 插入文档
+ * @param  {[type]} this *ElasticSearch) InsertDoc(idx string, docid string, body string [description]
+ * @return {[type]}      [description]
+ */
+func (this *ElasticSearch) InsertDoc(idx string, docid string, body string) {
+	req := esapi.CreateRequest{
+		Index:        idx,
+		DocumentType: "doc",
+		DocumentID:   docid,
+		Body:         strings.NewReader(body),
+	}
+	resp, _ := req.Do(context.Background(), this.Client)
+	return this.ReadResp(resp)
 }
 
-// 添加新的内容
-func (this *ElasticSearch) InsertDoc(index, _type, id string, ttl int, v interface{}) error {
+/**
+ * 删除文档
+ */
+func (this *ElasticSearch) DeleteDoc(idx string, docid string) {
+	req := esapi.DeleteRequest{
+		Index:        idx,
+		DocumentType: "doc",
+		DocumentID:   docid,
+	}
 
-    defer Common.CheckPanic()
-    this.Lock()
-    defer this.Unlock()
-
-    var args map[string]interface{} = nil
-    if ttl > 0 {
-        args = map[string]interface{}{"ttl": ttl}
-    }
-
-    _, err := this.Index(this.CalcIndex(index, _type, id), _type, id, args, v)
-    if err != nil {
-        return err
-    }
-
-    return nil
+	resp, _ := req.Do(context.Background(), this.Client)
+	return this.ReadResp(resp)
 }
 
-// 修改内容
-func (this *ElasticSearch) UpdateDoc(index, _type, id string, v map[string]interface{}) error {
-    defer Common.CheckPanic()
-    this.Lock()
-    defer this.Unlock()
+/**
+ * ElasticSearch 搜索
+ * @param  {[type]} this *ElasticSearch) Search(index string, body string [description]
+ * @return {[type]}      [description]
+ */
+func (this *ElasticSearch) Search(index string, body string) ([]interface{}, error) {
+	req := esapi.SearchRequest{
+		Index:        []string{index},
+		DocumentType: []string{"doc"},
+		Body:         strings.NewReader(body),
+	}
+	resp, err := req.Do(context.Background(), this.Client)
+	if err != nil {
+		fmt.Println(err)
+	}
 
-    doc := map[string]map[string]interface{}{"doc": v}
-    _, err := this.Update(this.CalcIndex(index, _type, id), _type, id, nil, doc)
-    if err != nil {
-        return err
-    }
+	simpleJson, _ := this.ReadResp(resp)
 
-    return nil
+	return simpleJson.Get("hits").Get("hits").Array()
 }
 
-// 查找内容
-func (this *ElasticSearch) GetDoc(index, _type, id string, doc interface{}) error {
-    data, err := this.GetDocSource(index, _type, id)
-    if err != nil {
-        return err
-    }
+func (this *ElasticSearch) Count(index string, body string) {
+	req := esapi.SearchRequest{
+		Index:        []string{index},
+		DocumentType: []string{"doc"},
+		Body:         strings.NewReader(body),
+	}
+	res, err := req.Do(context.Background(), this.Client)
+	defer res.Body.Close()
+	if err != nil {
+		fmt.Println(err)
+	}
 
-    if err = json.Unmarshal(data, doc); err != nil {
-        return err
-    }
+	simpleJson, _ := this.ReadResp(res)
 
-    return nil
+	fmt.Println(simpleJson.Get("total"))
+	// resp, _ := ioutil.ReadAll(res.Body)
+
+	// jsonObj, err := simplejson.NewJson(resp)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// }
+	// fmt.Println(jsonObj)
+
 }
 
-// 查找内容的源数据
-func (this *ElasticSearch) GetDocSource(index, _type, id string) ([]byte, error) {
-    defer Common.CheckPanic()
-    this.Lock()
-    defer this.Unlock()
+/**
+ * 读取ElasticSearch 返回
+ * @param  {[type]} this *ElasticSearch) ReadResp(resp *esapi.Response) (*simplejson.Json, error [description]
+ * @return {[type]}      [description]
+ */
+func (this *ElasticSearch) ReadResp(resp *esapi.Response) (*simplejson.Json, error) {
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
 
-    rsp, err := this.Get(this.CalcIndex(index, _type, id), _type, id, nil)
-    if err != nil {
-        return nil, err
-    }
-
-    return rsp.Source.MarshalJSON()
-}
-
-// 删除一条记录
-func (this *ElasticSearch) DeleteDoc(index, _type, id string) error {
-    defer Common.CheckPanic()
-    this.Lock()
-    defer this.Unlock()
-
-    _, err := this.Delete(this.CalcIndex(index, _type, id), _type, id, nil)
-    if err != nil {
-        return err
-    }
-
-    return nil
+	return simplejson.NewJson(body)
 }
